@@ -50,6 +50,7 @@ from ontology import (
     OntologySearcher,
     OntologyStore,
 )
+from ontology.models import ConfirmedMapping
 
 DEFAULT_DB = "ontology.db"
 
@@ -473,6 +474,144 @@ def show(ctx: click.Context, classification: str) -> None:
                 click.echo(f"    fields      : {', '.join(dc.field_names)}")
             if dc.aliases:
                 click.echo(f"    aliases     : {', '.join(dc.aliases)}")
+
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# confirm-mapping
+# ---------------------------------------------------------------------------
+
+@cli.command("confirm-mapping")
+@click.argument("classification")
+@click.argument("dataset_name")
+@click.argument("dataset_field")
+@click.option(
+    "--canonical", "-c", default=None,
+    help="Canonical FieldDefinition name this field maps to.",
+)
+@click.option(
+    "--confidence", default=None, type=float,
+    help="Similarity confidence score (0.0–1.0).",
+)
+@click.option(
+    "--source", default="manual",
+    type=click.Choice(["manual", "auto"], case_sensitive=False),
+    show_default=True,
+)
+@click.option("--notes", "-n", default=None, help="Optional notes.")
+@click.pass_context
+def confirm_mapping(
+    ctx: click.Context,
+    classification: str,
+    dataset_name: str,
+    dataset_field: str,
+    canonical: Optional[str],
+    confidence: Optional[float],
+    source: str,
+    notes: Optional[str],
+) -> None:
+    """Record that DATASET_FIELD from DATASET_NAME maps to a node.
+
+    CLASSIFICATION is the full five-part node classification string.
+
+    \b
+    Example:
+      python cli.py confirm-mapping \\
+        observable:demography:population-distribution:spatial-aggregate:population-spatial-aggregate \\
+        "My Census 2024" total_pop --canonical total_population --confidence 0.92
+    """
+    store = _store(ctx)
+    node = store.get_node_by_classification(classification)
+    if not node:
+        click.echo(f"Node not found: {classification}", err=True)
+        sys.exit(1)
+
+    mapping = store.confirm_mapping(
+        node_id=node.id,
+        dataset_name=dataset_name,
+        dataset_field=dataset_field,
+        canonical_field=canonical,
+        confidence=confidence,
+        source=source,
+        notes=notes,
+    )
+    click.echo(
+        f"Confirmed: '{dataset_field}' from '{dataset_name}'"
+        f" -> {classification}"
+        + (f" (canonical: {canonical})" if canonical else "")
+        + (f"  [{confidence:.2f}]" if confidence is not None else "")
+    )
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# history
+# ---------------------------------------------------------------------------
+
+@cli.command("history")
+@click.option("--dataset", "-D", default=None, help="Filter by dataset name.")
+@click.option("--field", "-f", default=None, help="Filter by dataset field name.")
+@click.option("--classification", default=None, help="Filter by node classification.")
+@click.option(
+    "--source", default=None,
+    type=click.Choice(["manual", "auto"], case_sensitive=False),
+)
+@click.pass_context
+def history(
+    ctx: click.Context,
+    dataset: Optional[str],
+    field: Optional[str],
+    classification: Optional[str],
+    source: Optional[str],
+) -> None:
+    """Show confirmed field mapping history.
+
+    At least one of --dataset, --field, or --classification should be provided
+    to avoid listing every mapping in the database.
+
+    \b
+    Examples:
+      python cli.py history --dataset "My Census 2024"
+      python cli.py history --dataset "My Census 2024" --field total_pop
+      python cli.py history --classification observable:demography:...:population-spatial-aggregate
+    """
+    store = _store(ctx)
+
+    node_id: Optional[str] = None
+    if classification:
+        node = store.get_node_by_classification(classification)
+        if not node:
+            click.echo(f"Node not found: {classification}", err=True)
+            sys.exit(1)
+        node_id = node.id
+
+    if dataset and field:
+        mappings = store.get_field_history(dataset_name=dataset, dataset_field=field)
+    elif dataset:
+        mappings = store.get_field_history(dataset_name=dataset)
+    else:
+        mappings = store.get_confirmed_mappings(node_id=node_id, source=source)
+
+    if not mappings:
+        click.echo("(no confirmed mappings found)")
+    else:
+        for m in mappings:
+            node_label = m.node_id
+            # Try to resolve node classification for readability
+            node_obj = store.get_node(m.node_id)
+            if node_obj:
+                node_label = node_obj.classification.classification_str
+
+            conf_str = f"  [{m.confidence:.2f}]" if m.confidence is not None else ""
+            canonical_str = f"  -> {m.canonical_field}" if m.canonical_field else ""
+            click.echo(
+                f"{m.created_at[:19]}  [{m.source}]{conf_str}"
+                f"  '{m.dataset_field}'{canonical_str}"
+                f"  @ {node_label}"
+            )
+            if m.notes:
+                click.echo(f"    notes: {m.notes}")
 
     store.close()
 

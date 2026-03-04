@@ -32,7 +32,7 @@ import difflib
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .models import OntologyNode
+from .models import ConfirmedMapping, DatasetClassification, OntologyNode
 from .store import OntologyStore
 
 
@@ -368,6 +368,102 @@ class OntologySearcher:
             unmatched_fields=unmatched_fields,
             suggested_mapping=suggested_mapping,
         )
+
+    # ------------------------------------------------------------------
+    # Confirming results
+    # ------------------------------------------------------------------
+
+    def confirm_result(
+        self,
+        result: DatasetSearchResult,
+        dataset_name: str,
+        accepted_fields: Optional[list[str]] = None,
+        source: str = "auto",
+        notes: Optional[str] = None,
+        register_dataset: bool = True,
+    ) -> list[ConfirmedMapping]:
+        """
+        Persist a search result's field mappings as confirmed matches.
+
+        Parameters
+        ----------
+        result:
+            The DatasetSearchResult to confirm.
+        dataset_name:
+            The actual name of the incoming dataset (used as the key for
+            future history look-ups).
+        accepted_fields:
+            Which incoming field names to confirm.  ``None`` accepts all
+            matched fields.  Unmatched fields are never confirmed.
+        source:
+            ``"auto"`` when the caller is accepting a search result
+            programmatically; ``"manual"`` when a human has verified it.
+        notes:
+            Free-text notes stored alongside each mapping.
+        register_dataset:
+            If ``True`` (default), also upsert a DatasetClassification on the
+            observable so the confirmed fields improve future search results.
+
+        Returns
+        -------
+        List of ConfirmedMapping objects that were persisted.
+        """
+        node = result.observable
+        to_confirm = [
+            fm for fm in result.field_matches
+            if accepted_fields is None or fm.query_field in accepted_fields
+        ]
+
+        confirmed: list[ConfirmedMapping] = []
+        for fm in to_confirm:
+            canonical = result.suggested_mapping.get(fm.query_field, fm.matched_field)
+            mapping = self.store.confirm_mapping(
+                node_id=node.id,
+                dataset_name=dataset_name,
+                dataset_field=fm.query_field,
+                canonical_field=canonical,
+                confidence=fm.score,
+                source=source,
+                notes=notes,
+            )
+            confirmed.append(mapping)
+
+        if register_dataset and to_confirm:
+            confirmed_fields = [fm.query_field for fm in to_confirm]
+            # Check whether this dataset is already registered on the node
+            existing = next(
+                (dc for dc in node.dataset_classifications
+                 if dc.dataset_name == dataset_name),
+                None,
+            )
+            if existing is None:
+                dc = DatasetClassification(
+                    dataset_name=dataset_name,
+                    field_names=confirmed_fields,
+                )
+                self.store.add_dataset_classification(node.id, dc)
+            else:
+                new_fields = [
+                    f for f in confirmed_fields if f not in existing.field_names
+                ]
+                if new_fields:
+                    # Fetch a fresh copy, mutate the target DC, then re-save
+                    updated_node = self.store.get_node(node.id)
+                    if updated_node:
+                        target_dc = next(
+                            (dc for dc in updated_node.dataset_classifications
+                             if dc.dataset_name == dataset_name),
+                            None,
+                        )
+                        if target_dc:
+                            target_dc.field_names.extend(new_fields)
+                        self.store.add_node(updated_node)
+
+        return confirmed
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _resolve_canonical(obs: OntologyNode, matched_name: str) -> Optional[str]:

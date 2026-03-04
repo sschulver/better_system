@@ -22,6 +22,7 @@ Quick start::
         print(r.summary())
 """
 from .models import (
+    ConfirmedMapping,
     DatasetClassification,
     FieldDefinition,
     NodeClassification,
@@ -31,6 +32,7 @@ from .search import OntologySearcher, DatasetSearchResult
 from .store import OntologyStore
 
 __all__ = [
+    "ConfirmedMapping",
     "DatasetClassification",
     "DatasetSearchResult",
     "FieldDefinition",

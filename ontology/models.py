@@ -10,6 +10,7 @@ Examples:
 """
 from __future__ import annotations
 
+import datetime
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -147,3 +148,29 @@ class OntologyNode:
 
     def add_dataset_classification(self, dc: DatasetClassification) -> None:
         self.dataset_classifications.append(dc)
+
+
+@dataclass
+class ConfirmedMapping:
+    """
+    A persisted record that a specific dataset field was confirmed to map to
+    a specific observable node (and optionally a canonical FieldDefinition).
+
+    Created either automatically (source="auto") when a caller accepts a
+    DatasetSearchResult, or manually (source="manual") by a user.
+
+    Once confirmed, the mapping serves as institutional memory: future searches
+    can surface prior confirmations and the dataset field can be promoted into
+    the node's DatasetClassification so it improves future matching.
+    """
+    node_id: str
+    dataset_name: str
+    dataset_field: str               # incoming column name
+    canonical_field: Optional[str]   # FieldDefinition.name, or None if new/unknown
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    confidence: Optional[float] = None  # similarity score; None for manual entries
+    source: str = "manual"              # "auto" | "manual"
+    notes: Optional[str] = None
+    created_at: str = field(
+        default_factory=lambda: datetime.datetime.utcnow().isoformat()
+    )

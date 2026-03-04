@@ -4,6 +4,7 @@ Tests for the ontological classification system.
 import pytest
 
 from ontology.models import (
+    ConfirmedMapping,
     DatasetClassification,
     FieldDefinition,
     NodeClassification,
@@ -500,3 +501,212 @@ class TestOntologySearcher:
         summary = results[0].summary()
         assert "observable:demography" in summary
         assert "score=" in summary
+
+
+# ---------------------------------------------------------------------------
+# ConfirmedMapping / store
+# ---------------------------------------------------------------------------
+
+class TestConfirmedMappings:
+    def test_confirm_mapping_persists(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        m = store.confirm_mapping(
+            node_id=obs.id,
+            dataset_name="My New Dataset",
+            dataset_field="total_pop",
+            canonical_field="total_population",
+            confidence=0.91,
+            source="auto",
+        )
+        assert m.id is not None
+        assert m.node_id == obs.id
+        assert m.dataset_name == "My New Dataset"
+        assert m.dataset_field == "total_pop"
+        assert m.canonical_field == "total_population"
+        assert m.confidence == pytest.approx(0.91)
+        assert m.source == "auto"
+        assert m.created_at  # non-empty
+
+    def test_confirm_mapping_manual_no_confidence(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        m = store.confirm_mapping(
+            node_id=obs.id,
+            dataset_name="My Dataset",
+            dataset_field="pop",
+            source="manual",
+        )
+        assert m.confidence is None
+        assert m.canonical_field is None
+
+    def test_get_confirmed_mappings_by_node(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        store.confirm_mapping(obs.id, "DS1", "total_pop", "total_population", 0.9)
+        store.confirm_mapping(obs.id, "DS2", "density", "population_density", 0.8)
+
+        mappings = store.get_confirmed_mappings(node_id=obs.id)
+        assert len(mappings) == 2
+
+    def test_get_confirmed_mappings_by_dataset(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        store.confirm_mapping(obs.id, "DS1", "total_pop", confidence=0.9)
+        store.confirm_mapping(obs.id, "DS2", "other_field", confidence=0.8)
+
+        mappings = store.get_confirmed_mappings(dataset_name="DS1")
+        assert len(mappings) == 1
+        assert mappings[0].dataset_name == "DS1"
+
+    def test_get_confirmed_mappings_by_source(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        store.confirm_mapping(obs.id, "DS1", "f1", source="auto", confidence=0.9)
+        store.confirm_mapping(obs.id, "DS1", "f2", source="manual")
+
+        auto = store.get_confirmed_mappings(source="auto")
+        manual = store.get_confirmed_mappings(source="manual")
+        assert all(m.source == "auto" for m in auto)
+        assert all(m.source == "manual" for m in manual)
+
+    def test_get_field_history(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        store.confirm_mapping(obs.id, "DS1", "total_pop", "total_population", 0.9)
+        store.confirm_mapping(obs.id, "DS1", "density", "population_density", 0.85)
+        store.confirm_mapping(obs.id, "DS1", "total_pop", "total_population", 0.95)
+
+        all_hist = store.get_field_history("DS1")
+        assert len(all_hist) == 3
+
+        field_hist = store.get_field_history("DS1", "total_pop")
+        assert len(field_hist) == 2
+        assert all(m.dataset_field == "total_pop" for m in field_hist)
+
+    def test_get_field_history_ordered_newest_first(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        store.confirm_mapping(obs.id, "DS1", "f", confidence=0.8)
+        store.confirm_mapping(obs.id, "DS1", "f", confidence=0.95)
+        hist = store.get_field_history("DS1", "f")
+        # newest first → higher confidence entry was inserted last
+        assert hist[0].confidence == pytest.approx(0.95)
+
+    def test_delete_confirmed_mapping(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        m = store.confirm_mapping(obs.id, "DS1", "total_pop", confidence=0.9)
+        assert store.delete_confirmed_mapping(m.id)
+        assert store.get_confirmed_mappings(node_id=obs.id) == []
+
+    def test_delete_nonexistent_mapping(self, store):
+        assert not store.delete_confirmed_mapping("nonexistent")
+
+    def test_cascade_delete_on_node_removal(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        store.confirm_mapping(obs.id, "DS1", "total_pop", confidence=0.9)
+        store.delete_node(obs.id)
+        # All confirmed mappings for this node should be gone
+        assert store.get_confirmed_mappings(node_id=obs.id) == []
+
+    def test_mapping_with_notes(self, store):
+        obs = _observable_node()
+        store.add_node(obs)
+        m = store.confirm_mapping(
+            obs.id, "DS1", "total_pop", notes="Verified by analyst on 2024-01-01"
+        )
+        retrieved = store.get_confirmed_mappings(node_id=obs.id)
+        assert retrieved[0].notes == "Verified by analyst on 2024-01-01"
+
+
+# ---------------------------------------------------------------------------
+# confirm_result on OntologySearcher
+# ---------------------------------------------------------------------------
+
+class TestConfirmResult:
+    @pytest.fixture
+    def searcher(self, populated_store):
+        return OntologySearcher(populated_store, threshold=0.5)
+
+    def test_confirm_result_persists_field_matches(self, searcher, populated_store):
+        results = searcher.search(field_names=["total_population", "pop_density"])
+        assert results
+        confirmed = searcher.confirm_result(results[0], dataset_name="New Survey 2024")
+        assert len(confirmed) == 2
+        fields = {m.dataset_field for m in confirmed}
+        assert "total_population" in fields
+        assert "pop_density" in fields
+
+    def test_confirm_result_records_confidence(self, searcher):
+        results = searcher.search(field_names=["total_population"])
+        confirmed = searcher.confirm_result(results[0], dataset_name="DS X")
+        assert confirmed[0].confidence is not None
+        assert 0.5 < confirmed[0].confidence <= 1.0
+
+    def test_confirm_result_records_canonical(self, searcher):
+        results = searcher.search(field_names=["pop_total"])
+        confirmed = searcher.confirm_result(results[0], dataset_name="DS X")
+        assert confirmed[0].canonical_field == "total_population"
+
+    def test_confirm_result_accepted_fields_subset(self, searcher):
+        results = searcher.search(field_names=["total_population", "pop_density"])
+        confirmed = searcher.confirm_result(
+            results[0],
+            dataset_name="DS X",
+            accepted_fields=["total_population"],
+        )
+        assert len(confirmed) == 1
+        assert confirmed[0].dataset_field == "total_population"
+
+    def test_confirm_result_registers_dataset(self, searcher, populated_store):
+        results = searcher.search(field_names=["total_population"])
+        searcher.confirm_result(
+            results[0], dataset_name="Brand New Dataset", register_dataset=True
+        )
+        obs = populated_store.get_node(results[0].observable.id)
+        ds_names = {dc.dataset_name for dc in obs.dataset_classifications}
+        assert "Brand New Dataset" in ds_names
+
+    def test_confirm_result_no_register(self, searcher, populated_store):
+        results = searcher.search(field_names=["total_population"])
+        searcher.confirm_result(
+            results[0], dataset_name="Not Registered", register_dataset=False
+        )
+        obs = populated_store.get_node(results[0].observable.id)
+        ds_names = {dc.dataset_name for dc in obs.dataset_classifications}
+        assert "Not Registered" not in ds_names
+
+    def test_confirm_result_merges_existing_dataset(self, searcher, populated_store):
+        # ACS is already registered; confirming a new field should merge it in
+        results = searcher.search(
+            dataset_name="American Community Survey",
+            field_names=["total_population"],
+        )
+        assert results
+        searcher.confirm_result(
+            results[0],
+            dataset_name="American Community Survey",
+            register_dataset=True,
+        )
+        obs = populated_store.get_node(results[0].observable.id)
+        acs = next(
+            dc for dc in obs.dataset_classifications
+            if dc.dataset_name == "American Community Survey"
+        )
+        assert "total_population" in acs.field_names
+
+    def test_confirm_result_source_stored(self, searcher, populated_store):
+        results = searcher.search(field_names=["total_population"])
+        confirmed = searcher.confirm_result(
+            results[0], dataset_name="DS X", source="manual"
+        )
+        assert confirmed[0].source == "manual"
+
+    def test_confirm_result_queryable_via_history(self, searcher, populated_store):
+        results = searcher.search(field_names=["total_population"])
+        searcher.confirm_result(results[0], dataset_name="History DS")
+        hist = populated_store.get_field_history("History DS")
+        assert len(hist) >= 1
+        assert hist[0].dataset_field == "total_population"

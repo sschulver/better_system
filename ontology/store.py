@@ -9,6 +9,7 @@ field_aliases           – aliases for a field definition
 dataset_classifications – known datasets attached to a node
 dataset_field_names     – actual column names within a dataset
 dataset_aliases         – alternative names a dataset is known by
+confirmed_mappings      – persisted field-to-observable match records
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .models import (
+    ConfirmedMapping,
     DatasetClassification,
     FieldDefinition,
     NodeClassification,
@@ -85,6 +87,22 @@ CREATE TABLE IF NOT EXISTS dataset_aliases (
     alias      TEXT NOT NULL,
     PRIMARY KEY (dataset_id, alias)
 );
+
+CREATE TABLE IF NOT EXISTS confirmed_mappings (
+    id              TEXT PRIMARY KEY,
+    node_id         TEXT NOT NULL REFERENCES nodes (id) ON DELETE CASCADE,
+    dataset_name    TEXT NOT NULL,
+    dataset_field   TEXT NOT NULL,
+    canonical_field TEXT,
+    confidence      REAL,
+    source          TEXT NOT NULL DEFAULT 'manual',
+    notes           TEXT,
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cm_node_id       ON confirmed_mappings (node_id);
+CREATE INDEX IF NOT EXISTS idx_cm_dataset_name  ON confirmed_mappings (dataset_name);
+CREATE INDEX IF NOT EXISTS idx_cm_field         ON confirmed_mappings (dataset_name, dataset_field);
 """
 
 
@@ -421,6 +439,135 @@ class OntologyStore:
             description=row["description"],
             field_definitions=field_defs,
             dataset_classifications=dataset_classes,
+        )
+
+    # ------------------------------------------------------------------
+    # Confirmed mappings
+    # ------------------------------------------------------------------
+
+    def confirm_mapping(
+        self,
+        node_id: str,
+        dataset_name: str,
+        dataset_field: str,
+        canonical_field: Optional[str] = None,
+        confidence: Optional[float] = None,
+        source: str = "manual",
+        notes: Optional[str] = None,
+    ) -> ConfirmedMapping:
+        """
+        Persist a confirmed field-to-observable mapping.
+
+        Does not enforce uniqueness — multiple confirmations of the same
+        (dataset_name, dataset_field, node_id) triple are allowed so that
+        provenance history is preserved.
+        """
+        mapping = ConfirmedMapping(
+            node_id=node_id,
+            dataset_name=dataset_name,
+            dataset_field=dataset_field,
+            canonical_field=canonical_field,
+            confidence=confidence,
+            source=source,
+            notes=notes,
+        )
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO confirmed_mappings
+                    (id, node_id, dataset_name, dataset_field,
+                     canonical_field, confidence, source, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mapping.id,
+                    mapping.node_id,
+                    mapping.dataset_name,
+                    mapping.dataset_field,
+                    mapping.canonical_field,
+                    mapping.confidence,
+                    mapping.source,
+                    mapping.notes,
+                    mapping.created_at,
+                ),
+            )
+        return mapping
+
+    def get_confirmed_mappings(
+        self,
+        node_id: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> list[ConfirmedMapping]:
+        """
+        Query confirmed mappings with optional filters.
+
+        Results are ordered newest-first.
+        """
+        query = "SELECT * FROM confirmed_mappings WHERE 1=1"
+        params: list = []
+        if node_id:
+            query += " AND node_id = ?"
+            params.append(node_id)
+        if dataset_name:
+            query += " AND dataset_name = ?"
+            params.append(dataset_name)
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        query += " ORDER BY created_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_mapping(r) for r in rows]
+
+    def get_field_history(
+        self,
+        dataset_name: str,
+        dataset_field: Optional[str] = None,
+    ) -> list[ConfirmedMapping]:
+        """
+        Return all confirmed mappings for a dataset, optionally filtered to
+        a specific field.  Useful for showing "previously matched to X" in a UI.
+        """
+        if dataset_field:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM confirmed_mappings
+                WHERE dataset_name = ? AND dataset_field = ?
+                ORDER BY created_at DESC
+                """,
+                (dataset_name, dataset_field),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM confirmed_mappings
+                WHERE dataset_name = ?
+                ORDER BY dataset_field, created_at DESC
+                """,
+                (dataset_name,),
+            ).fetchall()
+        return [self._row_to_mapping(r) for r in rows]
+
+    def delete_confirmed_mapping(self, mapping_id: str) -> bool:
+        """Delete a single confirmed mapping by its ID."""
+        with self._conn:
+            result = self._conn.execute(
+                "DELETE FROM confirmed_mappings WHERE id = ?", (mapping_id,)
+            )
+        return result.rowcount > 0
+
+    @staticmethod
+    def _row_to_mapping(row: sqlite3.Row) -> ConfirmedMapping:
+        return ConfirmedMapping(
+            id=row["id"],
+            node_id=row["node_id"],
+            dataset_name=row["dataset_name"],
+            dataset_field=row["dataset_field"],
+            canonical_field=row["canonical_field"],
+            confidence=row["confidence"],
+            source=row["source"],
+            notes=row["notes"],
+            created_at=row["created_at"],
         )
 
     def close(self) -> None:
